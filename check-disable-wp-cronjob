@@ -1,0 +1,119 @@
+#!/bin/bash
+# =====================================================
+# Script: ตรวจสอบเว็บที่ยังไม่ได้ปิด DISABLE_WP_CRON
+# Usage: bash check_wp_cron.sh [home_path]
+# Default path: /home (ครอบคลุมทุก cPanel user)
+# =====================================================
+
+HOME_PATH="${1:-/home}"
+
+# สี
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+echo ""
+echo "======================================================"
+echo "   ตรวจสอบ DISABLE_WP_CRON ทุกเว็บใน $HOME_PATH"
+echo "======================================================"
+echo ""
+
+NOT_DISABLED=()
+DISABLED=()
+NO_CONFIG=()
+
+# วนหาทุก wp-config.php (ไม่รวม backup)
+while IFS= read -r config_file; do
+    site_dir=$(dirname "$config_file")
+    domain=$(basename "$site_dir")
+
+    # ข้าม backup files
+    if [[ "$config_file" == *backup* ]]; then
+        continue
+    fi
+
+    # เช็คว่ามี DISABLE_WP_CRON อยู่ไหม
+    if grep -q "DISABLE_WP_CRON" "$config_file" 2>/dev/null; then
+        # เช็คว่า set เป็น true ไหม
+        if grep -q "define.*DISABLE_WP_CRON.*true" "$config_file" 2>/dev/null; then
+            DISABLED+=("$domain|$config_file")
+        else
+            # มี define แต่เป็น false หรือค่าอื่น
+            NOT_DISABLED+=("$domain|$config_file|set_but_false")
+        fi
+    else
+        # ไม่มีเลย
+        NOT_DISABLED+=("$domain|$config_file|not_set")
+    fi
+
+done < <(find "$HOME_PATH" -name "wp-config.php" -not -path "*/backup*" -not -path "*-backup*" 2>/dev/null | sort)
+
+# ==================== แสดงผล ====================
+
+# เว็บที่ยังไม่ปิด
+echo -e "${RED}❌ เว็บที่ยังไม่ได้ปิด DISABLE_WP_CRON (${#NOT_DISABLED[@]} เว็บ):${NC}"
+echo "------------------------------------------------------"
+i=1
+for entry in "${NOT_DISABLED[@]}"; do
+    domain=$(echo "$entry" | cut -d'|' -f1)
+    config=$(echo "$entry" | cut -d'|' -f2)
+    status=$(echo "$entry" | cut -d'|' -f3)
+
+    if [[ "$status" == "set_but_false" ]]; then
+        label="${YELLOW}[ตั้งค่าแต่เป็น false]${NC}"
+    else
+        label="${RED}[ไม่มีค่านี้เลย]${NC}"
+    fi
+
+    echo -e "  $i. ${CYAN}$domain${NC} $label"
+    echo "     → $config"
+    ((i++))
+done
+
+echo ""
+
+# เว็บที่ปิดแล้ว
+echo -e "${GREEN}✅ เว็บที่ปิด DISABLE_WP_CRON แล้ว (${#DISABLED[@]} เว็บ):${NC}"
+echo "------------------------------------------------------"
+j=1
+for entry in "${DISABLED[@]}"; do
+    domain=$(echo "$entry" | cut -d'|' -f1)
+    echo -e "  $j. ${GREEN}$domain${NC}"
+    ((j++))
+done
+
+echo ""
+echo "======================================================"
+echo -e "  📊 สรุป:"
+echo -e "  🔴 ยังไม่ปิด : ${RED}${#NOT_DISABLED[@]} เว็บ${NC}"
+echo -e "  🟢 ปิดแล้ว  : ${GREEN}${#DISABLED[@]} เว็บ${NC}"
+TOTAL=$(( ${#NOT_DISABLED[@]} + ${#DISABLED[@]} ))
+echo -e "  📁 ทั้งหมด  : ${CYAN}${TOTAL} เว็บ${NC}"
+echo "======================================================"
+echo ""
+
+# ==================== สร้าง Command แก้ไขอัตโนมัติ ====================
+if [[ ${#NOT_DISABLED[@]} -gt 0 ]]; then
+    echo -e "${YELLOW}💡 ต้องการแก้ไขอัตโนมัติ? รันคำสั่งนี้:${NC}"
+    echo ""
+    echo "------------------------------------------------------"
+    echo "# คำสั่งเพิ่ม DISABLE_WP_CRON ให้ทุกเว็บที่ยังไม่ได้ปิด"
+    echo "------------------------------------------------------"
+
+    for entry in "${NOT_DISABLED[@]}"; do
+        config=$(echo "$entry" | cut -d'|' -f2)
+        status=$(echo "$entry" | cut -d'|' -f3)
+        domain=$(echo "$entry" | cut -d'|' -f1)
+
+        if [[ "$status" == "not_set" ]]; then
+            echo "# → $domain"
+            echo "sed -i \"/<?php/a define('DISABLE_WP_CRON', true);\" \"$config\""
+        else
+            echo "# → $domain (แก้ false → true)"
+            echo "sed -i \"s/define.*DISABLE_WP_CRON.*false.*/define('DISABLE_WP_CRON', true);/\" \"$config\""
+        fi
+        echo ""
+    done
+fi
