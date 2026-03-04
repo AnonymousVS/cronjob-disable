@@ -1,0 +1,180 @@
+#!/bin/bash
+# =====================================================
+# Script: ตรวจสอบและแก้ไข DISABLE_WP_CRON ทุกเว็บ
+# รองรับ /home, /home2, /home3 ... อัตโนมัติ
+# Usage: bash disable-wp-cronjob.sh
+#        bash disable-wp-cronjob.sh /home/jan2026newkey
+# =====================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+NC='\033[0m'
+
+# ==================== หา Home Directories ====================
+
+if [[ -n "$1" ]]; then
+    SEARCH_PATHS=("$1")
+else
+    SEARCH_PATHS=()
+    for dir in /home /home2 /home3 /home4 /home5; do
+        [[ -d "$dir" ]] && SEARCH_PATHS+=("$dir")
+    done
+fi
+
+echo ""
+echo "======================================================"
+echo "   DISABLE_WP_CRON - Auto Scanner & Fixer"
+echo "======================================================"
+echo ""
+echo -e "${BLUE}📂 Home directories ที่พบ:${NC}"
+for path in "${SEARCH_PATHS[@]}"; do
+    echo -e "   ✔ ${CYAN}$path${NC}"
+done
+echo ""
+
+NOT_DISABLED=()
+DISABLED=()
+
+# ==================== สแกนทุก Path ====================
+
+for SEARCH_PATH in "${SEARCH_PATHS[@]}"; do
+    echo -e "${PURPLE}🔍 กำลังสแกน: $SEARCH_PATH${NC}"
+
+    while IFS= read -r config_file; do
+        [[ "$config_file" == *backup* ]] && continue
+        [[ "$config_file" == *-backup* ]] && continue
+        [[ "$config_file" == *.bak* ]] && continue
+
+        domain=$(basename "$(dirname "$config_file")")
+        home_label=$(echo "$config_file" | grep -oP '^/home\d*')
+
+        if grep -q "DISABLE_WP_CRON" "$config_file" 2>/dev/null; then
+            if grep -q "define.*DISABLE_WP_CRON.*true" "$config_file" 2>/dev/null; then
+                DISABLED+=("$domain|$config_file|$home_label")
+            else
+                NOT_DISABLED+=("$domain|$config_file|set_but_false|$home_label")
+            fi
+        else
+            NOT_DISABLED+=("$domain|$config_file|not_set|$home_label")
+        fi
+
+    done < <(find "$SEARCH_PATH" -name "wp-config.php" \
+        -not -path "*/backup*" \
+        -not -path "*-backup*" \
+        -not -name "*.bak*" \
+        2>/dev/null | sort)
+done
+
+echo ""
+
+# ==================== แสดงผลก่อนแก้ไข ====================
+
+echo -e "${RED}❌ เว็บที่ยังไม่ได้ปิด (${#NOT_DISABLED[@]} เว็บ):${NC}"
+echo "------------------------------------------------------"
+i=1
+for entry in "${NOT_DISABLED[@]}"; do
+    domain=$(echo "$entry" | cut -d'|' -f1)
+    config=$(echo "$entry" | cut -d'|' -f2)
+    status=$(echo "$entry" | cut -d'|' -f3)
+    home_label=$(echo "$entry" | cut -d'|' -f4)
+    [[ "$status" == "set_but_false" ]] && label="${YELLOW}[มีค่าแต่เป็น false]${NC}" || label="${RED}[ไม่มีค่านี้เลย]${NC}"
+    echo -e "  $i. ${CYAN}$domain${NC} ${PURPLE}[$home_label]${NC} $label"
+    ((i++))
+done
+
+echo ""
+echo -e "${GREEN}✅ เว็บที่ปิดแล้ว (${#DISABLED[@]} เว็บ):${NC}"
+echo "------------------------------------------------------"
+j=1
+for entry in "${DISABLED[@]}"; do
+    domain=$(echo "$entry" | cut -d'|' -f1)
+    home_label=$(echo "$entry" | cut -d'|' -f3)
+    echo -e "  $j. ${GREEN}$domain${NC} ${PURPLE}[$home_label]${NC}"
+    ((j++))
+done
+
+TOTAL=$(( ${#NOT_DISABLED[@]} + ${#DISABLED[@]} ))
+echo ""
+echo "======================================================"
+echo -e "  📊 สรุปก่อนแก้ไข:"
+for path in "${SEARCH_PATHS[@]}"; do
+    count=$(find "$path" -name "wp-config.php" -not -path "*/backup*" -not -name "*.bak*" 2>/dev/null | wc -l)
+    echo -e "  📂 $path : ${CYAN}$count เว็บ${NC}"
+done
+echo -e "  🔴 ยังไม่ปิด : ${RED}${#NOT_DISABLED[@]} เว็บ${NC}"
+echo -e "  🟢 ปิดแล้ว  : ${GREEN}${#DISABLED[@]} เว็บ${NC}"
+echo -e "  📁 ทั้งหมด  : ${CYAN}${TOTAL} เว็บ${NC}"
+echo "======================================================"
+echo ""
+
+if [[ ${#NOT_DISABLED[@]} -eq 0 ]]; then
+    echo -e "${GREEN}🎉 ทุกเว็บปิด DISABLE_WP_CRON แล้ว ไม่มีอะไรต้องแก้ไข!${NC}"
+    exit 0
+fi
+
+# ==================== แก้ไขอัตโนมัติทันที ====================
+
+echo -e "${BLUE}🔧 กำลังแก้ไข wp-config.php อัตโนมัติ...${NC}"
+echo "======================================================"
+echo ""
+
+SUCCESS=()
+FAILED=()
+
+for entry in "${NOT_DISABLED[@]}"; do
+    domain=$(echo "$entry" | cut -d'|' -f1)
+    config=$(echo "$entry" | cut -d'|' -f2)
+    status=$(echo "$entry" | cut -d'|' -f3)
+    home_label=$(echo "$entry" | cut -d'|' -f4)
+
+    echo -ne "  🔧 ${CYAN}$domain${NC} ${PURPLE}[$home_label]${NC} ... "
+
+    # backup ก่อนแก้ไข
+    cp "$config" "${config}.bak_wpcron_$(date +%Y%m%d%H%M%S)" 2>/dev/null
+
+    if [[ "$status" == "not_set" ]]; then
+        sed -i "/^<?php/a define('DISABLE_WP_CRON', true);" "$config" 2>/dev/null
+    else
+        sed -i "s/define( *'DISABLE_WP_CRON' *, *false *);/define('DISABLE_WP_CRON', true);/g" "$config" 2>/dev/null
+        sed -i "s/define( *\"DISABLE_WP_CRON\" *, *false *);/define('DISABLE_WP_CRON', true);/g" "$config" 2>/dev/null
+    fi
+
+    if grep -q "define.*DISABLE_WP_CRON.*true" "$config" 2>/dev/null; then
+        echo -e "${GREEN}✅ สำเร็จ${NC}"
+        SUCCESS+=("$domain")
+    else
+        echo -e "${RED}❌ ล้มเหลว${NC}"
+        FAILED+=("$domain|$config")
+        backup_file=$(ls -t "${config}.bak_wpcron_"* 2>/dev/null | head -1)
+        [[ -f "$backup_file" ]] && cp "$backup_file" "$config"
+    fi
+done
+
+# ==================== สรุปหลังแก้ไข ====================
+
+echo ""
+echo "======================================================"
+echo -e "  📊 สรุปหลังแก้ไข:"
+echo -e "  ✅ แก้ไขสำเร็จ : ${GREEN}${#SUCCESS[@]} เว็บ${NC}"
+echo -e "  ❌ แก้ไขล้มเหลว: ${RED}${#FAILED[@]} เว็บ${NC}"
+echo -e "  🟢 ปิดอยู่แล้ว : ${GREEN}${#DISABLED[@]} เว็บ${NC}"
+echo -e "  📁 ทั้งหมด     : ${CYAN}${TOTAL} เว็บ${NC}"
+echo "======================================================"
+
+if [[ ${#FAILED[@]} -gt 0 ]]; then
+    echo ""
+    echo -e "${RED}⚠️  เว็บที่แก้ไขล้มเหลว (ตรวจสอบ permission):${NC}"
+    for entry in "${FAILED[@]}"; do
+        domain=$(echo "$entry" | cut -d'|' -f1)
+        config=$(echo "$entry" | cut -d'|' -f2)
+        echo -e "  - ${RED}$domain${NC} → $config"
+    done
+fi
+
+echo ""
+echo -e "${YELLOW}💡 Backup: wp-config.php.bak_wpcron_YYYYMMDDHHMMSS${NC}"
+echo ""
