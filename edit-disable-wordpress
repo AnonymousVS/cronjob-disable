@@ -2,8 +2,9 @@
 # =====================================================
 # Script: ตรวจสอบและแก้ไข DISABLE_WP_CRON ทุกเว็บ
 # รองรับ /home, /home2, /home3 ... อัตโนมัติ
+# ✅ ป้องกันการเพิ่มซ้ำ + ลบบรรทัดซ้ำอัตโนมัติ
 # Usage: bash edit-disable-wordpress
-#        bash edit-disable-wordpress /home/username
+#        bash edit-disable-wordpress /home/jan2026newkey
 # =====================================================
 
 RED='\033[0;31m'
@@ -14,66 +15,10 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 NC='\033[0m'
 
-# [ISSUE3 FIX] fallback log path ถ้าไม่ใช่ root
-if [[ $EUID -eq 0 ]]; then
-    LOG_FILE="/var/log/disable-wpcron.log"
-else
-    LOG_FILE="${HOME}/disable-wpcron.log"
-fi
-LOCK_FILE="${LOG_FILE}.lock"
-RESULT_DIR="/tmp/wpcron-setup-$$"
-RAM_PER_JOB_MB=100
-
-# [BUG3 FIX] ประกาศ TMP vars ตั้งแต่ต้น เพื่อให้ cleanup() ลบได้เสมอ
-TMP_SCAN=""
-TMP_DEDUP=""
-
-# ==================== cPanel-specific dirs ที่ไม่ใช่ user ====================
-SKIP_DIRS="virtfs|cPanelInstall|almalinux|mig_data|lscache|error_log|lost\+found"
-
-log() {
-    local DATE
-    DATE=$(date '+%Y-%m-%d %H:%M:%S')
-    echo -e "$1"
-    ( flock 200; echo "[$DATE] $(echo "$1" | sed 's/\x1b\[[0-9;]*m//g')" >> "$LOG_FILE" ) 200>"$LOCK_FILE"
-}
-
-# [BUG3 FIX] cleanup ครอบคลุม TMP_SCAN, TMP_DEDUP ด้วย
-cleanup() {
-    rm -rf "$RESULT_DIR"
-    rm -f "$LOCK_FILE"
-    [[ -n "$TMP_SCAN"  && -f "$TMP_SCAN"  ]] && rm -f "$TMP_SCAN"
-    [[ -n "$TMP_DEDUP" && -f "$TMP_DEDUP" ]] && rm -f "$TMP_DEDUP"
-}
-trap cleanup EXIT
-
-mkdir -p "$RESULT_DIR/result"
-
-START_TIME=$(date +%s)
-
-# ==================== คำนวณ MAX_JOBS จาก CPU + RAM ====================
-CPU_CORES=$(nproc 2>/dev/null || echo 2)
-TOTAL_RAM_MB=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo 512)
-MAX_JOBS_BY_RAM=$(( TOTAL_RAM_MB / RAM_PER_JOB_MB ))
-MAX_JOBS=$(( CPU_CORES < MAX_JOBS_BY_RAM ? CPU_CORES : MAX_JOBS_BY_RAM ))
-[ "$MAX_JOBS" -lt 1 ]  && MAX_JOBS=1
-[ "$MAX_JOBS" -gt 32 ] && MAX_JOBS=32
-
 # ==================== หา Home Directories ====================
-# [BUG1 FIX] แยก mode: ถ้า $1 เป็น user dir โดยตรง → สแกนเฉพาะ dir นั้น
-#            ถ้า $1 เป็น base dir (/home) → ใช้ get_cpanel_accounts ปกติ
-SINGLE_USER_MODE=false
+
 if [[ -n "$1" ]]; then
-    # ตรวจว่า $1 เป็น user dir หรือ base dir
-    # ถ้า parent ของ $1 คือ /home, /home2, ... → เป็น user dir โดยตรง
-    # ครอบคลุมทั้ง Structure 1 (/home/armadaso) และ Structure 2 (/home/y2026m02sv01)
-    _parent="$(dirname "$1")"
-    if echo "$_parent" | grep -qP '^/home\d*$'; then
-        SINGLE_USER_MODE=true
-        SINGLE_USER_DIR="$1"
-    else
-        SEARCH_PATHS=("$1")
-    fi
+    SEARCH_PATHS=("$1")
 else
     SEARCH_PATHS=()
     for dir in /home /home2 /home3 /home4 /home5; do
@@ -83,370 +28,260 @@ fi
 
 echo ""
 echo "======================================================"
-echo "   DISABLE_WP_CRON - Auto Scanner & Fixer"
-echo "======================================================"
-log " เริ่มเวลา  : $(date '+%Y-%m-%d %H:%M:%S')"
-log " CPU Cores : $CPU_CORES | RAM : ${TOTAL_RAM_MB} MB | MAX_JOBS : $MAX_JOBS"
+echo "   DISABLE_WP_CRON - Auto Scanner & Fixer v2"
+echo "   ✅ ป้องกันซ้ำ + ลบบรรทัดซ้ำอัตโนมัติ"
 echo "======================================================"
 echo ""
-
-# ====================================
-# ดึงรายชื่อ cPanel accounts จริงๆ
-# scan directory ตรงเสมอ + merge กับ cPanel list
-# รองรับ accounts ที่ migrate มา ซึ่งไม่อยู่ใน /var/cpanel/users/
-# ====================================
-get_cpanel_accounts() {
-    local base_dir="$1"
-    declare -A _found=()
-
-    # สแกน directory ตรงเสมอ — source of truth จริงๆ
-    # รองรับ migrated accounts ที่ไม่ได้ register ใน /var/cpanel/users/
-    for d in "${base_dir}"/*/; do
-        [[ ! -d "$d" ]] && continue
-        local user
-        user=$(basename "$d")
-        echo "$user" | grep -qE "^(${SKIP_DIRS})$" && continue
-        _found["$user"]=1
-    done
-
-    # เพิ่ม accounts จาก cPanel data (กรณีที่ home dir อยู่ที่อื่น)
-    if [ -d "/var/cpanel/users" ]; then
-        while IFS= read -r user; do
-            [ -d "${base_dir}/${user}" ] && _found["$user"]=1
-        done < <(ls /var/cpanel/users/ 2>/dev/null | grep -vE "^(root|nobody)$")
-    elif [ -f "/etc/trueuserdomains" ]; then
-        while IFS= read -r user; do
-            [ -d "${base_dir}/${user}" ] && _found["$user"]=1
-        done < <(awk '{print $NF}' /etc/trueuserdomains 2>/dev/null | sort -u | grep -vE "^(root|nobody)$")
-    fi
-
-    echo "${!_found[@]}"
-}
-
-# ==================== PRE-SCAN: นับ cPanel Accounts ====================
-# [BUG5 FIX] cache ผลของ get_cpanel_accounts ไว้ใน associative array
-#            เพื่อไม่ต้องเรียกซ้ำในช่วง FAST SCAN
-declare -A CACHED_USERS   # key=SPATH, value="user1 user2 ..."
-TOTAL_ACCOUNTS=0
-declare -A SEEN_USERS
-
-if $SINGLE_USER_MODE; then
-    # [BUG1 FIX] Single-user mode: แสดงเฉพาะ user เดียว ไม่ต้องนับ accounts
-    echo -e "${BLUE}📂 Single-user mode:${NC}"
-    echo -e "   ✔ ${CYAN}${SINGLE_USER_DIR}${NC}"
-    TOTAL_ACCOUNTS=1
-else
-    echo -e "${BLUE}📂 Home directories ที่พบ:${NC}"
-    for path in "${SEARCH_PATHS[@]}"; do
-        echo -e "   ✔ ${CYAN}$path${NC}"
-    done
-    echo ""
-
-    for SPATH in "${SEARCH_PATHS[@]}"; do
-        user_list="$(get_cpanel_accounts "$SPATH")"
-        CACHED_USERS["$SPATH"]="$user_list"     # cache ไว้ใช้ตอนสแกน
-        read -ra USERS <<< "$user_list"
-        for u in "${USERS[@]}"; do
-            [[ -z "${SEEN_USERS[$u]+_}" ]] && SEEN_USERS[$u]=1 && (( TOTAL_ACCOUNTS++ ))
-        done
-    done
-fi
-
-log " 👥 cPanel Accounts ที่พบ : $TOTAL_ACCOUNTS accounts"
-echo "======================================================"
-echo ""
-
-# ==================== FAST SCAN: Parallel per-user ====================
-# โครงสร้าง path ที่รู้แน่แล้ว 2 แบบ:
-#   Structure 1: scan_base/DOMAIN/wp-config.php         (depth=2 จาก scan_base)
-#   Structure 2: scan_base=public_html → DOMAIN/wp-config.php (depth=2 เช่นกัน)
-# -maxdepth 2  : จำกัดความลึก ไม่วิ่งเกิน DOMAIN/
-# -prune       : ตัด backup/cache dirs ที่ depth 1 ก่อนวิ่งเข้าไป
-# -execdir     : ตรวจ WordPress จริงแบบ inline ไม่มี subshell
-
-echo -e "${PURPLE}🔍 กำลังสแกน WordPress (Parallel per-user)...${NC}"
-
-TMP_SCAN=$(mktemp /tmp/wp_scan_XXXXXX)
-SCAN_PIDS=()
-
-# _fast_find: prune + execdir ในคำสั่งเดียว ไม่มี subshell
-# -maxdepth 2 : จำกัดความลึก (DOMAIN/wp-config.php = depth 2)
-# -prune      : ตัด backup/cache dirs ที่ depth 1 ก่อนวิ่งเข้าไป
-#               ห้ามใส่ -mindepth ใน expression เพราะ GNU find จะ skip
-#               depth < mindepth ทำให้ -prune ไม่ถูก evaluate
-# -execdir    : ตรวจ wp-includes/version.php inline ไม่มี subshell
-_fast_find() {
-    local scan_base="$1"
-    find "$scan_base" -maxdepth 2 \
-        \( -name "backup"   -o -name "backups"   -o -name "softaculous_backups" \
-        -o -name "node_modules" -o -name ".git"  -o -name "cache" \
-        -o -name ".trash"   -o -name "logs"      -o -name "mail" \
-        -o -name "awstats"  -o -name "webalizer" \) -prune \
-        -o -name "wp-config.php" -type f \
-           -execdir test -f wp-includes/version.php \; -print \
-        2>/dev/null
-}
-
-if $SINGLE_USER_MODE; then
-    if [[ -d "${SINGLE_USER_DIR}/public_html" ]]; then
-        _scan_base="${SINGLE_USER_DIR}/public_html"
-    else
-        _scan_base="${SINGLE_USER_DIR}"
-    fi
-    _fast_find "$_scan_base" >> "$TMP_SCAN" &
-    SCAN_PIDS+=($!)
-else
-    for SPATH in "${SEARCH_PATHS[@]}"; do
-        read -ra USERS <<< "${CACHED_USERS[$SPATH]}"
-        for user in "${USERS[@]}"; do
-            user_dir="${SPATH}/${user}"
-            [ ! -d "$user_dir" ] && continue
-
-            if [[ -d "${user_dir}/public_html" ]]; then
-                scan_base="${user_dir}/public_html"
-            else
-                scan_base="${user_dir}"
-            fi
-
-            _fast_find "$scan_base" >> "$TMP_SCAN" &
-            SCAN_PIDS+=($!)
-
-            if [ "${#SCAN_PIDS[@]}" -ge "$MAX_JOBS" ]; then
-                wait "${SCAN_PIDS[0]}"
-                SCAN_PIDS=("${SCAN_PIDS[@]:1}")
-            fi
-        done
-    done
-fi
-
-# spinner ระหว่างรอสแกน
-spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-si=0
-while true; do
-    running=false
-    for pid in "${SCAN_PIDS[@]}"; do
-        kill -0 "$pid" 2>/dev/null && running=true && break
-    done
-    $running || break
-    printf "\r  ${CYAN}%s  กำลังค้นหา wp-config.php ...${NC}" "${spin:$((si % ${#spin})):1}"
-    (( si++ )); sleep 0.1
+echo -e "${BLUE}📂 Home directories ที่พบ:${NC}"
+for path in "${SEARCH_PATHS[@]}"; do
+    echo -e "   ✔ ${CYAN}$path${NC}"
 done
-wait "${SCAN_PIDS[@]}" 2>/dev/null
-printf "\r  ${GREEN}✔  สแกนเสร็จแล้ว                          ${NC}\n\n"
+echo ""
 
-# ==================== inode dedup ====================
-# _is_real_wp ถูกจัดการโดย -execdir test ใน find แล้ว
-# เหลือแค่ dedup ด้วย inode กัน symlink นับซ้ำ
-TMP_DEDUP=$(mktemp /tmp/wp_dedup_XXXXXX)
-declare -A SEEN_INODE
-
-while IFS= read -r wpconfig; do
-    [[ -z "$wpconfig" ]] && continue
-    inode=$(stat -c "%d:%i" "$wpconfig" 2>/dev/null) || continue
-    [[ -n "${SEEN_INODE[$inode]+_}" ]] && continue
-    SEEN_INODE[$inode]=1
-    echo "$wpconfig"
-done < <(sort -u "$TMP_SCAN") > "$TMP_DEDUP"
-rm -f "$TMP_SCAN"; TMP_SCAN=""
-
-# ==================== วิเคราะห์สถานะแต่ละไฟล์ ====================
 NOT_DISABLED=()
 DISABLED=()
+DUPLICATED=()
 
-while IFS= read -r config_file; do
-    [[ -z "$config_file" ]] && continue
+# ==================== สแกนทุก Path ====================
 
-    site_dir="$(dirname "$config_file")/"
-    site_name=$(basename "${site_dir%/}")
-    # Structure 2: .../public_html/domain/ → ข้ามขึ้นไปชั้นบน domain คือชื่อที่ถูกต้องอยู่แล้ว
-    # กรณีที่ wp-config.php อยู่ใน public_html โดยตรง (single-site ไม่มี subdomain folder)
-    [ "$site_name" = "public_html" ] && site_name=$(basename "$(dirname "${site_dir%/}")")
-    home_label=$(echo "$config_file" | grep -oP '^/home\d*')
+for SEARCH_PATH in "${SEARCH_PATHS[@]}"; do
+    echo -e "${PURPLE}🔍 กำลังสแกน: $SEARCH_PATH${NC}"
 
-    # awk single-pass: อ่านไฟล์ครั้งเดียว ตัดสินใจใน awk ไม่มี grep 2 รอบ
-    # ข้าม comment, จับ true/false/ไม่มี ในการอ่านรอบเดียว
-    result=$(awk '
-        /^\s*#/ { next }
-        /define[[:space:]]*\([[:space:]]*['"'"'"]DISABLE_WP_CRON['"'"'"][[:space:]]*,[[:space:]]*true/ {
-            print "disabled"; exit
-        }
-        /DISABLE_WP_CRON/ { found=1 }
-        END { print (found ? "set_false" : "not_set") }
-    ' "$config_file" 2>/dev/null)
+    while IFS= read -r config_file; do
+        [[ "$config_file" == *backup* ]] && continue
+        [[ "$config_file" == *-backup* ]] && continue
+        [[ "$config_file" == *.bak* ]] && continue
 
-    case "$result" in
-        disabled)  DISABLED+=("$site_name|$config_file|$home_label") ;;
-        set_false) NOT_DISABLED+=("$site_name|$config_file|set_but_false|$home_label") ;;
-        *)         NOT_DISABLED+=("$site_name|$config_file|not_set|$home_label") ;;
-    esac
+        domain=$(basename "$(dirname "$config_file")")
+        home_label=$(echo "$config_file" | grep -oP '^/home\d*')
 
-done < "$TMP_DEDUP"
-rm -f "$TMP_DEDUP"; TMP_DEDUP=""
+        # นับจำนวนบรรทัดที่มี DISABLE_WP_CRON
+        cron_count=$(grep -c "DISABLE_WP_CRON" "$config_file" 2>/dev/null)
 
-TOTAL=$(( ${#NOT_DISABLED[@]} + ${#DISABLED[@]} ))
+        if [[ "$cron_count" -gt 1 ]]; then
+            # ✅ พบบรรทัดซ้ำ
+            DUPLICATED+=("$domain|$config_file|$cron_count|$home_label")
+        elif [[ "$cron_count" -eq 1 ]]; then
+            if grep -q "define.*DISABLE_WP_CRON.*true" "$config_file" 2>/dev/null; then
+                DISABLED+=("$domain|$config_file|$home_label")
+            else
+                NOT_DISABLED+=("$domain|$config_file|set_but_false|$home_label")
+            fi
+        else
+            NOT_DISABLED+=("$domain|$config_file|not_set|$home_label")
+        fi
 
-# ==================== แสดงผลก่อนแก้ไข ====================
-echo -e "${RED}❌ เว็บที่ยังไม่ได้ปิด (${#NOT_DISABLED[@]} เว็บ):${NC}"
-echo "------------------------------------------------------"
-i=1
-for entry in "${NOT_DISABLED[@]}"; do
-    site_name=$(echo  "$entry" | cut -d'|' -f1)
-    status=$(echo     "$entry" | cut -d'|' -f3)
-    home_label=$(echo "$entry" | cut -d'|' -f4)
-    [[ "$status" == "set_but_false" ]] \
-        && label="${YELLOW}[มีค่าแต่เป็น false]${NC}" \
-        || label="${RED}[ไม่มีค่านี้เลย]${NC}"
-    echo -e "  $i. ${CYAN}$site_name${NC} ${PURPLE}[$home_label]${NC} $label"
-    (( i++ ))
+    done < <(find "$SEARCH_PATH" -name "wp-config.php" \
+        -not -path "*/backup*" \
+        -not -path "*-backup*" \
+        -not -name "*.bak*" \
+        2>/dev/null | sort)
 done
 
 echo ""
-echo -e "${GREEN}✅ เว็บที่ปิดแล้ว (${#DISABLED[@]} เว็บ):${NC}"
-echo "------------------------------------------------------"
-j=1
-for entry in "${DISABLED[@]}"; do
-    site_name=$(echo  "$entry" | cut -d'|' -f1)
-    home_label=$(echo "$entry" | cut -d'|' -f3)
-    echo -e "  $j. ${GREEN}$site_name${NC} ${PURPLE}[$home_label]${NC}"
-    (( j++ ))
-done
 
+# ==================== แสดงผล: บรรทัดซ้ำ ====================
+
+if [[ ${#DUPLICATED[@]} -gt 0 ]]; then
+    echo -e "${YELLOW}⚠️  เว็บที่มี DISABLE_WP_CRON ซ้ำหลายบรรทัด (${#DUPLICATED[@]} เว็บ):${NC}"
+    echo "------------------------------------------------------"
+    i=1
+    for entry in "${DUPLICATED[@]}"; do
+        domain=$(echo "$entry" | cut -d'|' -f1)
+        config=$(echo "$entry" | cut -d'|' -f2)
+        count=$(echo "$entry" | cut -d'|' -f3)
+        home_label=$(echo "$entry" | cut -d'|' -f4)
+        echo -e "  $i. ${CYAN}$domain${NC} ${PURPLE}[$home_label]${NC} ${YELLOW}[ซ้ำ $count บรรทัด]${NC}"
+        ((i++))
+    done
+    echo ""
+fi
+
+# ==================== แสดงผล: ยังไม่ปิด ====================
+
+echo -e "${RED}❌ เว็บที่ยังไม่ได้ปิด (${#NOT_DISABLED[@]} เว็บ):${NC}"
+echo "------------------------------------------------------"
+if [[ ${#NOT_DISABLED[@]} -eq 0 ]]; then
+    echo -e "  ${GREEN}(ไม่มี)${NC}"
+else
+    i=1
+    for entry in "${NOT_DISABLED[@]}"; do
+        domain=$(echo "$entry" | cut -d'|' -f1)
+        config=$(echo "$entry" | cut -d'|' -f2)
+        status=$(echo "$entry" | cut -d'|' -f3)
+        home_label=$(echo "$entry" | cut -d'|' -f4)
+        [[ "$status" == "set_but_false" ]] && label="${YELLOW}[มีค่าแต่เป็น false]${NC}" || label="${RED}[ไม่มีค่านี้เลย]${NC}"
+        echo -e "  $i. ${CYAN}$domain${NC} ${PURPLE}[$home_label]${NC} $label"
+        ((i++))
+    done
+fi
+
+echo ""
+echo -e "${GREEN}✅ เว็บที่ปิดแล้ว (ไม่มีซ้ำ) (${#DISABLED[@]} เว็บ):${NC}"
+echo "------------------------------------------------------"
+if [[ ${#DISABLED[@]} -eq 0 ]]; then
+    echo -e "  ${GREEN}(ไม่มี)${NC}"
+else
+    j=1
+    for entry in "${DISABLED[@]}"; do
+        domain=$(echo "$entry" | cut -d'|' -f1)
+        home_label=$(echo "$entry" | cut -d'|' -f3)
+        echo -e "  $j. ${GREEN}$domain${NC} ${PURPLE}[$home_label]${NC}"
+        ((j++))
+    done
+fi
+
+TOTAL=$(( ${#NOT_DISABLED[@]} + ${#DISABLED[@]} + ${#DUPLICATED[@]} ))
 echo ""
 echo "======================================================"
 echo -e "  📊 สรุปก่อนแก้ไข:"
-echo -e "  👥 cPanel Accounts   : ${CYAN}${TOTAL_ACCOUNTS} accounts${NC}"
-echo -e "  🔴 ยังไม่ปิด         : ${RED}${#NOT_DISABLED[@]} เว็บ${NC}"
-echo -e "  🟢 ปิดแล้ว           : ${GREEN}${#DISABLED[@]} เว็บ${NC}"
-echo -e "  📁 WordPress รวม     : ${CYAN}${TOTAL} เว็บ${NC}"
+for path in "${SEARCH_PATHS[@]}"; do
+    count=$(find "$path" -name "wp-config.php" -not -path "*/backup*" -not -name "*.bak*" 2>/dev/null | wc -l)
+    echo -e "  📂 $path : ${CYAN}$count เว็บ${NC}"
+done
+echo -e "  🔴 ยังไม่ปิด       : ${RED}${#NOT_DISABLED[@]} เว็บ${NC}"
+echo -e "  🟡 ซ้ำ (ต้องลบซ้ำ) : ${YELLOW}${#DUPLICATED[@]} เว็บ${NC}"
+echo -e "  🟢 ปิดแล้ว (ปกติ)  : ${GREEN}${#DISABLED[@]} เว็บ${NC}"
+echo -e "  📁 ทั้งหมด         : ${CYAN}${TOTAL} เว็บ${NC}"
 echo "======================================================"
 echo ""
 
-if [[ ${#NOT_DISABLED[@]} -eq 0 ]]; then
-    log "${GREEN}🎉 ทุกเว็บปิด DISABLE_WP_CRON แล้ว ไม่มีอะไรต้องแก้ไข!${NC}"
+if [[ ${#NOT_DISABLED[@]} -eq 0 && ${#DUPLICATED[@]} -eq 0 ]]; then
+    echo -e "${GREEN}🎉 ทุกเว็บปิด DISABLE_WP_CRON แล้ว และไม่มีบรรทัดซ้ำ!${NC}"
     exit 0
 fi
 
-# ==================== Parallel Fix (Job Pool) ====================
-log "${BLUE}🔧 กำลังแก้ไข wp-config.php (Parallel MAX_JOBS=$MAX_JOBS)...${NC}"
-echo "======================================================"
-echo ""
+# ==================== STEP 1: แก้ไขบรรทัดซ้ำ ====================
 
-COUNTER_FILE="$RESULT_DIR/counter"
-FAILED_LIST="$RESULT_DIR/result/failedlist"   # [BUG2 FIX] ใช้ชื่อ failedlist ไม่ขึ้นต้นด้วย failed_
-echo 0 > "$COUNTER_FILE"
-TOTAL_TO_FIX=${#NOT_DISABLED[@]}
+if [[ ${#DUPLICATED[@]} -gt 0 ]]; then
+    echo -e "${BLUE}🔧 STEP 1: ลบบรรทัดซ้ำ DISABLE_WP_CRON (เหลือแค่ 1 บรรทัด)...${NC}"
+    echo "======================================================"
+    echo ""
 
-fix_site() {
-    local entry="$1"
-    local LOG_FILE="$2"
-    local LOCK_FILE="$3"
-    local RESULT_DIR="$4"
-    local TOTAL_TO_FIX="$5"
-    local COUNTER_FILE="$6"
-    local FAILED_LIST="$7"
+    DEDUP_SUCCESS=()
+    DEDUP_FAILED=()
 
-    local site_name config status home_label
-    site_name=$(echo  "$entry" | cut -d'|' -f1)
-    config=$(echo     "$entry" | cut -d'|' -f2)
-    status=$(echo     "$entry" | cut -d'|' -f3)
-    home_label=$(echo "$entry" | cut -d'|' -f4)
-    local UNIQUE="${BASHPID}_$(date +%s%N)"
+    for entry in "${DUPLICATED[@]}"; do
+        domain=$(echo "$entry" | cut -d'|' -f1)
+        config=$(echo "$entry" | cut -d'|' -f2)
+        count=$(echo "$entry" | cut -d'|' -f3)
+        home_label=$(echo "$entry" | cut -d'|' -f4)
 
-    _flog() {
-        local DATE
-        DATE=$(date '+%Y-%m-%d %H:%M:%S')
-        echo -e "$1"
-        ( flock 200; echo "[$DATE] $(echo "$1" | sed 's/\x1b\[[0-9;]*m//g')" >> "$LOG_FILE" ) 200>"$LOCK_FILE"
-    }
+        echo -ne "  🔧 ${CYAN}$domain${NC} ${PURPLE}[$home_label]${NC} [ซ้ำ $count → 1] ... "
 
-    _next_idx() {
-        ( flock 201
-          local n
-          n=$(cat "$COUNTER_FILE" 2>/dev/null || echo 0)
-          (( n++ ))
-          echo "$n" > "$COUNTER_FILE"
-          echo "$n"
-        ) 201>"${COUNTER_FILE}.lock"
-    }
+        # backup ก่อนแก้ไข
+        cp "$config" "${config}.bak_wpcron_$(date +%Y%m%d%H%M%S)" 2>/dev/null
 
-    local IDX
-    IDX=$(_next_idx)
+        # ลบบรรทัด DISABLE_WP_CRON ทั้งหมดออกก่อน
+        sed -i '/DISABLE_WP_CRON/d' "$config" 2>/dev/null
 
-    cp "$config" "${config}.bak_wpcron_$(date +%Y%m%d%H%M%S)" 2>/dev/null
+        # เพิ่มกลับเข้าไป 1 บรรทัด ใต้ <?php
+        sed -i '/^<?php/a define('\''DISABLE_WP_CRON'\'', true);' "$config" 2>/dev/null
 
-    if [[ "$status" == "not_set" ]]; then
-        sed -i "/^<?php/a define('DISABLE_WP_CRON', true);" "$config" 2>/dev/null
-    else
-        sed -i \
-            -e "s/define( *'DISABLE_WP_CRON' *, *false *);/define('DISABLE_WP_CRON', true);/g" \
-            -e "s/define( *\"DISABLE_WP_CRON\" *, *false *);/define('DISABLE_WP_CRON', true);/g" \
-            "$config" 2>/dev/null
-    fi
+        # ตรวจสอบผลลัพธ์
+        new_count=$(grep -c "DISABLE_WP_CRON" "$config" 2>/dev/null)
+        if [[ "$new_count" -eq 1 ]] && grep -q "define.*DISABLE_WP_CRON.*true" "$config" 2>/dev/null; then
+            echo -e "${GREEN}✅ สำเร็จ (เหลือ 1 บรรทัด)${NC}"
+            DEDUP_SUCCESS+=("$domain")
+        else
+            echo -e "${RED}❌ ล้มเหลว (พบ $new_count บรรทัด)${NC}"
+            DEDUP_FAILED+=("$domain|$config")
+            # restore backup
+            backup_file=$(ls -t "${config}.bak_wpcron_"* 2>/dev/null | head -1)
+            [[ -f "$backup_file" ]] && cp "$backup_file" "$config"
+        fi
+    done
 
-    # awk single-pass verify (สอดคล้องกับ analysis phase)
-    if awk '
-        /^\s*#/ { next }
-        /define[[:space:]]*\([[:space:]]*['"'"'"]DISABLE_WP_CRON['"'"'"][[:space:]]*,[[:space:]]*true/ {
-            found=1; exit
-        }
-        END { exit(!found) }
-    ' "$config" 2>/dev/null; then
-        _flog "  ✅ [${IDX}/${TOTAL_TO_FIX}] \033[0;36m${site_name}\033[0m \033[0;35m[${home_label}]\033[0m → สำเร็จ"
-        touch "${RESULT_DIR}/result/success_${UNIQUE}"
-    else
-        _flog "  ❌ [${IDX}/${TOTAL_TO_FIX}] \033[0;31m${site_name}\033[0m \033[0;35m[${home_label}]\033[0m → ล้มเหลว"
-        touch "${RESULT_DIR}/result/fail_${UNIQUE}"    # [BUG2 FIX] เปลี่ยนจาก failed_ → fail_
-        # rollback
-        local bak
-        bak=$(ls -t "${config}.bak_wpcron_"* 2>/dev/null | head -1)
-        [[ -f "$bak" ]] && cp "$bak" "$config"
-        # [BUG4 FIX] ใช้ flock กัน race condition ตอน write failed list
-        ( flock 202; echo "${site_name}|${config}" >> "$FAILED_LIST" ) 202>"${FAILED_LIST}.lock"
-    fi
-}
+    echo ""
+    echo -e "  📊 ลบซ้ำ: สำเร็จ ${GREEN}${#DEDUP_SUCCESS[@]}${NC} / ล้มเหลว ${RED}${#DEDUP_FAILED[@]}${NC}"
+    echo ""
+fi
 
-export -f fix_site
+# ==================== STEP 2: แก้ไขเว็บที่ยังไม่ได้ปิด ====================
 
-# Job Pool
-declare -a FIX_PIDS=()
-for entry in "${NOT_DISABLED[@]}"; do
-    fix_site "$entry" "$LOG_FILE" "$LOCK_FILE" "$RESULT_DIR" "$TOTAL_TO_FIX" "$COUNTER_FILE" "$FAILED_LIST" &
-    FIX_PIDS+=($!)
+if [[ ${#NOT_DISABLED[@]} -gt 0 ]]; then
+    echo -e "${BLUE}🔧 STEP 2: เพิ่ม/แก้ไข DISABLE_WP_CRON สำหรับเว็บที่ยังไม่ปิด...${NC}"
+    echo "======================================================"
+    echo ""
 
-    if [ "${#FIX_PIDS[@]}" -ge "$MAX_JOBS" ]; then
-        wait "${FIX_PIDS[0]}"
-        FIX_PIDS=("${FIX_PIDS[@]:1}")
-    fi
-done
-for pid in "${FIX_PIDS[@]}"; do wait "$pid"; done
+    SUCCESS=()
+    FAILED=()
+
+    for entry in "${NOT_DISABLED[@]}"; do
+        domain=$(echo "$entry" | cut -d'|' -f1)
+        config=$(echo "$entry" | cut -d'|' -f2)
+        status=$(echo "$entry" | cut -d'|' -f3)
+        home_label=$(echo "$entry" | cut -d'|' -f4)
+
+        echo -ne "  🔧 ${CYAN}$domain${NC} ${PURPLE}[$home_label]${NC} ... "
+
+        # backup ก่อนแก้ไข
+        cp "$config" "${config}.bak_wpcron_$(date +%Y%m%d%H%M%S)" 2>/dev/null
+
+        if [[ "$status" == "not_set" ]]; then
+            # ยังไม่มี → เพิ่มใหม่ 1 บรรทัด
+            sed -i '/^<?php/a define('\''DISABLE_WP_CRON'\'', true);' "$config" 2>/dev/null
+        else
+            # มีแต่เป็น false → เปลี่ยนเป็น true
+            sed -i "s/define( *'DISABLE_WP_CRON' *, *false *);/define('DISABLE_WP_CRON', true);/g" "$config" 2>/dev/null
+            sed -i "s/define( *\"DISABLE_WP_CRON\" *, *false *);/define('DISABLE_WP_CRON', true);/g" "$config" 2>/dev/null
+        fi
+
+        if grep -q "define.*DISABLE_WP_CRON.*true" "$config" 2>/dev/null; then
+            echo -e "${GREEN}✅ สำเร็จ${NC}"
+            SUCCESS+=("$domain")
+        else
+            echo -e "${RED}❌ ล้มเหลว${NC}"
+            FAILED+=("$domain|$config")
+            backup_file=$(ls -t "${config}.bak_wpcron_"* 2>/dev/null | head -1)
+            [[ -f "$backup_file" ]] && cp "$backup_file" "$config"
+        fi
+    done
+
+    echo ""
+fi
 
 # ==================== สรุปหลังแก้ไข ====================
-END_TIME=$(date +%s)
-ELAPSED=$(( END_TIME - START_TIME ))
-
-SUCCESS_COUNT=$(find "$RESULT_DIR/result" -name "success_*" 2>/dev/null | wc -l)
-FAILED_COUNT=$(find  "$RESULT_DIR/result" -name "fail_*"    2>/dev/null | wc -l)  # [BUG2 FIX]
 
 echo ""
 echo "======================================================"
-log " 📊 สรุปหลังแก้ไข:"
-log " 👥 cPanel Accounts    : ${CYAN}${TOTAL_ACCOUNTS} accounts${NC}"
-log " 📁 WordPress รวม      : ${CYAN}${TOTAL} เว็บ${NC}"
-log " ✅ แก้ไขสำเร็จ        : ${GREEN}${SUCCESS_COUNT} เว็บ${NC}"
-log " ❌ แก้ไขล้มเหลว       : ${RED}${FAILED_COUNT} เว็บ${NC}"
-log " 🟢 ปิดอยู่แล้ว        : ${GREEN}${#DISABLED[@]} เว็บ${NC}"
-log " ⏱  เวลาที่ใช้          : $(( ELAPSED / 60 )) นาที $(( ELAPSED % 60 )) วินาที"
+echo -e "  📊 สรุปหลังแก้ไข:"
+if [[ ${#DUPLICATED[@]} -gt 0 ]]; then
+    echo -e "  🟡 ลบซ้ำสำเร็จ    : ${GREEN}${#DEDUP_SUCCESS[@]} เว็บ${NC}"
+    echo -e "  🟡 ลบซ้ำล้มเหลว   : ${RED}${#DEDUP_FAILED[@]} เว็บ${NC}"
+fi
+if [[ ${#NOT_DISABLED[@]} -gt 0 ]]; then
+    echo -e "  ✅ เพิ่ม/แก้สำเร็จ : ${GREEN}${#SUCCESS[@]} เว็บ${NC}"
+    echo -e "  ❌ เพิ่ม/แก้ล้มเหลว: ${RED}${#FAILED[@]} เว็บ${NC}"
+fi
+echo -e "  🟢 ปิดอยู่แล้ว (ปกติ): ${GREEN}${#DISABLED[@]} เว็บ${NC}"
+echo -e "  📁 ทั้งหมด          : ${CYAN}${TOTAL} เว็บ${NC}"
 echo "======================================================"
 
-if [[ -f "$FAILED_LIST" ]]; then
+# แสดงรายชื่อที่ล้มเหลว
+HAS_FAILURES=0
+if [[ ${#DEDUP_FAILED[@]} -gt 0 ]]; then
+    HAS_FAILURES=1
+    echo ""
+    echo -e "${RED}⚠️  เว็บที่ลบซ้ำล้มเหลว (ตรวจสอบ permission):${NC}"
+    for entry in "${DEDUP_FAILED[@]}"; do
+        domain=$(echo "$entry" | cut -d'|' -f1)
+        config=$(echo "$entry" | cut -d'|' -f2)
+        echo -e "  - ${RED}$domain${NC} → $config"
+    done
+fi
+
+if [[ ${#FAILED[@]} -gt 0 ]]; then
+    HAS_FAILURES=1
     echo ""
     echo -e "${RED}⚠️  เว็บที่แก้ไขล้มเหลว (ตรวจสอบ permission):${NC}"
-    while IFS='|' read -r site_name config; do
-        echo -e "  - ${RED}${site_name}${NC} → $config"
-    done < "$FAILED_LIST"
+    for entry in "${FAILED[@]}"; do
+        domain=$(echo "$entry" | cut -d'|' -f1)
+        config=$(echo "$entry" | cut -d'|' -f2)
+        echo -e "  - ${RED}$domain${NC} → $config"
+    done
 fi
 
 echo ""
 echo -e "${YELLOW}💡 Backup: wp-config.php.bak_wpcron_YYYYMMDDHHMMSS${NC}"
-echo -e "${YELLOW}📋 Log: ${LOG_FILE}${NC}"
 echo ""
