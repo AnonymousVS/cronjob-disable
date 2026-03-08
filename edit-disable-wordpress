@@ -1,13 +1,17 @@
 #!/bin/bash
 # =====================================================
 # Script: ตรวจสอบและแก้ไข DISABLE_WP_CRON ทุกเว็บ
-# ✅ ป้องกันการเพิ่มซ้ำ + ลบบรรทัดซ้ำอัตโนมัติ
-# ✅ ระบุแค่ชื่อ cPanel → สคริปต์หา path จริงเอง
-# ✅ ตรวจ symlink / โฟลเดอร์เปล่า / ข้อมูลจริง อัตโนมัติ
+# รองรับทุก path structure:
+#   /home/user/domain/wp-config.php
+#   /home/user/public_html/wp-config.php
+#   /home/user/public_html/domain/wp-config.php
+#   /home2/user/... , /home3/user/... ฯลฯ
+# หา home directory จาก /etc/passwd อัตโนมัติ
 #
 # Usage:
-#   bash edit-disable-wordpress user1 user2 user3
-#   bash edit-disable-wordpress              ← จะถามชื่อ
+#   bash edit-disable-wordpress                  ← scan ทุก cPanel user
+#   bash edit-disable-wordpress host1            ← scan เฉพาะ user
+#   bash edit-disable-wordpress host1 host2 ...  ← หลาย user
 # =====================================================
 
 RED='\033[0;31m'
@@ -16,183 +20,107 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
-GRAY='\033[0;90m'
 NC='\033[0m'
 
-# ==================== กำหนดชื่อ Home base ที่จะค้นหา ====================
+# ==================== ฟังก์ชันหา home จาก username ====================
 
-HOME_BASES=()
-for dir in /home /home2 /home3 /home4 /home5; do
-    [[ -d "$dir" ]] && HOME_BASES+=("$dir")
-done
+get_home_dir() {
+    local user="$1"
+    # ถ้าใส่ path เต็มมาแล้ว (/home/... หรือ /home2/...)
+    if [[ "$user" == /* && -d "$user" ]]; then
+        echo "$user"
+        return
+    fi
+    # หาจาก /etc/passwd ก่อน (แม่นยำที่สุด)
+    local home
+    home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6)
+    if [[ -n "$home" && -d "$home" ]]; then
+        echo "$home"
+        return
+    fi
+    # fallback: ลองหาใน /home, /home2 ... /home9
+    for base in /home /home2 /home3 /home4 /home5 /home6 /home7 /home8 /home9; do
+        if [[ -d "$base/$user" ]]; then
+            echo "$base/$user"
+            return
+        fi
+    done
+    echo ""
+}
 
-echo ""
-echo "======================================================"
-echo "   DISABLE_WP_CRON - Auto Scanner & Fixer v5"
-echo "   ✅ ป้องกันซ้ำ + ลบซ้ำ + ตรวจ symlink/เปล่า"
-echo "======================================================"
-echo ""
+# ==================== รวบรวม SEARCH_PATHS ====================
 
-# ==================== รับชื่อ cPanel user ====================
-
-CPANEL_USERS=()
+SEARCH_PATHS=()
 
 if [[ $# -gt 0 ]]; then
-    CPANEL_USERS=("$@")
+    # ระบุ user มา (1 คนหรือหลายคน)
+    for arg in "$@"; do
+        home=$(get_home_dir "$arg")
+        if [[ -n "$home" ]]; then
+            SEARCH_PATHS+=("$home")
+        else
+            echo -e "${RED}⚠️  หาไม่พบ home directory ของ: $arg${NC}"
+        fi
+    done
 else
-    echo -e "${YELLOW}📝 กรอกชื่อ cPanel user (คั่นด้วย space):${NC}"
-    echo -e "${CYAN}   ตัวอย่าง: armadaso armadaso2 d13752 host1${NC}"
-    echo ""
-    read -rp "   → " input_users
-
-    if [[ -z "$input_users" ]]; then
-        echo -e "${RED}❌ ไม่ได้ระบุชื่อ user${NC}"
-        exit 1
-    fi
-
-    read -ra CPANEL_USERS <<< "$input_users"
+    # ไม่ระบุ user → scan ทุก cPanel user จาก /etc/passwd
+    while IFS=: read -r _ _ _ _ _ homedir _; do
+        # เอาเฉพาะ path ที่ขึ้นต้นด้วย /home
+        [[ "$homedir" != /home* ]] && continue
+        [[ ! -d "$homedir" ]] && continue
+        # ข้าม system user
+        find "$homedir" -maxdepth 3 -name "wp-config.php" -quit 2>/dev/null | grep -q . || continue
+        SEARCH_PATHS+=("$homedir")
+    done < /etc/passwd
 fi
 
-echo -e "${BLUE}📂 Home directories ที่พบ:${NC}"
-for h in "${HOME_BASES[@]}"; do
-    echo -e "   ✔ ${CYAN}$h${NC}"
-done
 echo ""
-echo -e "${BLUE}👤 cPanel user ที่ระบุ: ${CYAN}${#CPANEL_USERS[@]} user${NC}"
+echo "======================================================"
+echo "   DISABLE_WP_CRON - Auto Scanner & Fixer v3"
+echo "   ✅ รองรับทุก path + หา home อัตโนมัติ"
+echo "======================================================"
 echo ""
-
-# ==================== ค้นหา path จริงของแต่ละ user ====================
-
-echo -e "${PURPLE}🔍 ตรวจสอบ path ของแต่ละ cPanel user...${NC}"
-echo "------------------------------------------------------"
-
-VALID_PATHS=()
-NOT_FOUND_USERS=()
-
-for user in "${CPANEL_USERS[@]}"; do
-    found_real=0
-    echo -e "  👤 ${CYAN}$user${NC}:"
-
-    for base in "${HOME_BASES[@]}"; do
-        full_path="$base/$user"
-
-        # ไม่มีอยู่เลย
-        if [[ ! -e "$full_path" ]]; then
-            continue
-        fi
-
-        # เป็น symlink
-        if [[ -L "$full_path" ]]; then
-            link_target=$(readlink -f "$full_path")
-            echo -e "     ${GRAY}$full_path → symlink → $link_target (ข้าม)${NC}"
-            continue
-        fi
-
-        # เป็น directory แต่อาจเปล่า → เช็คว่ามี public_html หรือมี wp-config.php
-        if [[ -d "$full_path" ]]; then
-            # เช็คว่ามี wp-config.php ข้างในไหม
-            wp_count=$(find "$full_path" -maxdepth 4 -name "wp-config.php" \
-                -not -path "*/backup*" -not -path "*-backup*" -not -name "*.bak*" \
-                2>/dev/null | head -1 | wc -l)
-
-            if [[ "$wp_count" -gt 0 ]]; then
-                echo -e "     ${GREEN}$full_path → ✅ มี WordPress (ใช้อันนี้)${NC}"
-                VALID_PATHS+=("$full_path")
-                found_real=1
-            else
-                # เช็คว่า public_html มีไฟล์อะไรไหม
-                if [[ -d "$full_path/public_html" ]]; then
-                    file_count=$(find "$full_path/public_html" -maxdepth 1 -type f 2>/dev/null | wc -l)
-                    if [[ "$file_count" -eq 0 ]]; then
-                        echo -e "     ${GRAY}$full_path → โฟลเดอร์เปล่า (ไม่มี WordPress) (ข้าม)${NC}"
-                    else
-                        echo -e "     ${YELLOW}$full_path → มีไฟล์แต่ไม่มี WordPress (ข้าม)${NC}"
-                    fi
-                else
-                    dir_count=$(find "$full_path" -maxdepth 1 -mindepth 1 2>/dev/null | wc -l)
-                    if [[ "$dir_count" -eq 0 ]]; then
-                        echo -e "     ${GRAY}$full_path → โฟลเดอร์ว่างเปล่า (ข้าม)${NC}"
-                    else
-                        echo -e "     ${GRAY}$full_path → ไม่มี public_html / ไม่มี WordPress (ข้าม)${NC}"
-                    fi
-                fi
-            fi
-        fi
-    done
-
-    if [[ $found_real -eq 0 ]]; then
-        NOT_FOUND_USERS+=("$user")
-        echo -e "     ${RED}⚠️  ไม่พบ WordPress ของ $user ในทุก path${NC}"
-    fi
-done
-
-echo ""
-
-# แจ้ง user ที่หาไม่เจอ
-if [[ ${#NOT_FOUND_USERS[@]} -gt 0 ]]; then
-    echo -e "${RED}⚠️  user ที่ไม่พบ WordPress (${#NOT_FOUND_USERS[@]} user):${NC}"
-    for u in "${NOT_FOUND_USERS[@]}"; do
-        echo -e "   ❌ ${RED}$u${NC}"
-    done
-    echo ""
-fi
-
-if [[ ${#VALID_PATHS[@]} -eq 0 ]]; then
-    echo -e "${RED}❌ ไม่พบ WordPress ที่ต้องแก้ไข ออกจากโปรแกรม${NC}"
-    exit 1
-fi
-
-echo -e "${GREEN}✅ path ที่จะทำงาน (${#VALID_PATHS[@]} path):${NC}"
-for path in "${VALID_PATHS[@]}"; do
+echo -e "${BLUE}📂 Home directories ที่จะสแกน:${NC}"
+for path in "${SEARCH_PATHS[@]}"; do
     echo -e "   ✔ ${CYAN}$path${NC}"
 done
 echo ""
 
-# ==================== ตัวแปรรวมทั้งหมด ====================
+if [[ ${#SEARCH_PATHS[@]} -eq 0 ]]; then
+    echo -e "${RED}❌ ไม่พบ home directory ที่จะสแกน${NC}"
+    exit 1
+fi
 
-GRAND_NOT_DISABLED=0
-GRAND_DISABLED=0
-GRAND_DUPLICATED=0
-GRAND_DEDUP_SUCCESS=0
-GRAND_DEDUP_FAILED=0
-GRAND_ADD_SUCCESS=0
-GRAND_ADD_FAILED=0
-GRAND_TOTAL=0
-ALL_FAILURES=()
+NOT_DISABLED=()
+DISABLED=()
+DUPLICATE=()
 
-# ==================== วนทีละ cPanel ====================
+# ==================== สแกนทุก Path (deep find) ====================
 
-CPANEL_INDEX=0
-CPANEL_TOTAL=${#VALID_PATHS[@]}
-
-for SEARCH_PATH in "${VALID_PATHS[@]}"; do
-    ((CPANEL_INDEX++))
-    user_name=$(basename "$SEARCH_PATH")
-    home_base=$(dirname "$SEARCH_PATH")
-    label="${home_base}/${user_name}"
-
-    echo ""
-    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${PURPLE}  [$CPANEL_INDEX/$CPANEL_TOTAL] 🔍 สแกน: ${CYAN}$label${NC}"
-    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-    NOT_DISABLED=()
-    DISABLED=()
-    DUPLICATED=()
+for SEARCH_PATH in "${SEARCH_PATHS[@]}"; do
+    echo -e "${PURPLE}🔍 กำลังสแกน: $SEARCH_PATH${NC}"
 
     while IFS= read -r config_file; do
-        [[ "$config_file" == *backup* ]] && continue
-        [[ "$config_file" == *-backup* ]] && continue
-        [[ "$config_file" == *.bak* ]] && continue
+        # ข้าม backup ทุกรูปแบบ
+        [[ "$config_file" == *backup*      ]] && continue
+        [[ "$config_file" == *-backup*     ]] && continue
+        [[ "$config_file" == *.bak*        ]] && continue
+        [[ "$config_file" == *.bak_wpcron* ]] && continue
+        [[ "$config_file" == */cache/*     ]] && continue
+        [[ "$config_file" == */uploads/*   ]] && continue
 
         domain=$(basename "$(dirname "$config_file")")
+        # ถ้า domain เป็น public_html ให้ใช้ชื่อ user แทน
+        if [[ "$domain" == "public_html" ]]; then
+            domain=$(basename "$(dirname "$(dirname "$config_file")")")
+            domain="${domain}(public_html)"
+        fi
 
-        # นับจำนวนบรรทัดที่มี DISABLE_WP_CRON
-        cron_count=$(grep -c "DISABLE_WP_CRON" "$config_file" 2>/dev/null)
+        count=$(grep -c "DISABLE_WP_CRON" "$config_file" 2>/dev/null || echo 0)
 
-        if [[ "$cron_count" -gt 1 ]]; then
-            DUPLICATED+=("$domain|$config_file|$cron_count")
-        elif [[ "$cron_count" -eq 1 ]]; then
+        if [[ "$count" -gt 1 ]]; then
+            DUPLICATE+=("$domain|$config_file")
+        elif [[ "$count" -eq 1 ]]; then
             if grep -q "define.*DISABLE_WP_CRON.*true" "$config_file" 2>/dev/null; then
                 DISABLED+=("$domain|$config_file")
             else
@@ -202,137 +130,161 @@ for SEARCH_PATH in "${VALID_PATHS[@]}"; do
             NOT_DISABLED+=("$domain|$config_file|not_set")
         fi
 
-    done < <(find "$SEARCH_PATH" -name "wp-config.php" \
-        -not -path "*/backup*" \
-        -not -path "*-backup*" \
-        -not -name "*.bak*" \
+    done < <(find "$SEARCH_PATH" -maxdepth 6 -name "wp-config.php" \
+        -not -path "*/backup*"      \
+        -not -path "*-backup*"      \
+        -not -name "*.bak*"         \
+        -not -name "*.bak_wpcron*"  \
+        -not -path "*/cache/*"      \
+        -not -path "*/uploads/*"    \
         2>/dev/null | sort)
-
-    local_total=$(( ${#NOT_DISABLED[@]} + ${#DISABLED[@]} + ${#DUPLICATED[@]} ))
-    GRAND_TOTAL=$((GRAND_TOTAL + local_total))
-
-    # ถ้าไม่เจอ wp-config.php เลย
-    if [[ $local_total -eq 0 ]]; then
-        echo -e "  ${YELLOW}(ไม่พบ wp-config.php ใน path นี้)${NC}"
-        continue
-    fi
-
-    # --- แสดงผล ---
-    if [[ ${#DUPLICATED[@]} -gt 0 ]]; then
-        for entry in "${DUPLICATED[@]}"; do
-            domain=$(echo "$entry" | cut -d'|' -f1)
-            count=$(echo "$entry" | cut -d'|' -f3)
-            echo -e "  🟡 ${CYAN}$domain${NC} ${YELLOW}[ซ้ำ $count บรรทัด]${NC}"
-        done
-    fi
-    if [[ ${#NOT_DISABLED[@]} -gt 0 ]]; then
-        for entry in "${NOT_DISABLED[@]}"; do
-            domain=$(echo "$entry" | cut -d'|' -f1)
-            status=$(echo "$entry" | cut -d'|' -f3)
-            [[ "$status" == "set_but_false" ]] && s="[false]" || s="[ไม่มี]"
-            echo -e "  🔴 ${CYAN}$domain${NC} ${RED}$s${NC}"
-        done
-    fi
-    if [[ ${#DISABLED[@]} -gt 0 ]]; then
-        for entry in "${DISABLED[@]}"; do
-            domain=$(echo "$entry" | cut -d'|' -f1)
-            echo -e "  🟢 ${GREEN}$domain${NC} → skip"
-        done
-    fi
-
-    GRAND_DISABLED=$((GRAND_DISABLED + ${#DISABLED[@]}))
-    GRAND_DUPLICATED=$((GRAND_DUPLICATED + ${#DUPLICATED[@]}))
-    GRAND_NOT_DISABLED=$((GRAND_NOT_DISABLED + ${#NOT_DISABLED[@]}))
-
-    # --- ลบซ้ำ ---
-    if [[ ${#DUPLICATED[@]} -gt 0 ]]; then
-        echo ""
-        echo -e "  ${BLUE}🔧 ลบบรรทัดซ้ำ:${NC}"
-        for entry in "${DUPLICATED[@]}"; do
-            domain=$(echo "$entry" | cut -d'|' -f1)
-            config=$(echo "$entry" | cut -d'|' -f2)
-            count=$(echo "$entry" | cut -d'|' -f3)
-
-            echo -ne "     ${CYAN}$domain${NC} [ซ้ำ $count → 1] ... "
-
-            cp "$config" "${config}.bak_wpcron_$(date +%Y%m%d%H%M%S)" 2>/dev/null
-            sed -i '/DISABLE_WP_CRON/d' "$config" 2>/dev/null
-            sed -i '/^<?php/a define('\''DISABLE_WP_CRON'\'', true);' "$config" 2>/dev/null
-
-            new_count=$(grep -c "DISABLE_WP_CRON" "$config" 2>/dev/null)
-            if [[ "$new_count" -eq 1 ]] && grep -q "define.*DISABLE_WP_CRON.*true" "$config" 2>/dev/null; then
-                echo -e "${GREEN}✅ สำเร็จ${NC}"
-                ((GRAND_DEDUP_SUCCESS++))
-            else
-                echo -e "${RED}❌ ล้มเหลว${NC}"
-                ((GRAND_DEDUP_FAILED++))
-                ALL_FAILURES+=("$label → $domain (ลบซ้ำ) → $config")
-                backup_file=$(ls -t "${config}.bak_wpcron_"* 2>/dev/null | head -1)
-                [[ -f "$backup_file" ]] && cp "$backup_file" "$config"
-            fi
-        done
-    fi
-
-    # --- เพิ่ม/แก้ไข ---
-    if [[ ${#NOT_DISABLED[@]} -gt 0 ]]; then
-        echo ""
-        echo -e "  ${BLUE}🔧 เพิ่ม/แก้ไข:${NC}"
-        for entry in "${NOT_DISABLED[@]}"; do
-            domain=$(echo "$entry" | cut -d'|' -f1)
-            config=$(echo "$entry" | cut -d'|' -f2)
-            status=$(echo "$entry" | cut -d'|' -f3)
-
-            echo -ne "     ${CYAN}$domain${NC} ... "
-
-            cp "$config" "${config}.bak_wpcron_$(date +%Y%m%d%H%M%S)" 2>/dev/null
-
-            if [[ "$status" == "not_set" ]]; then
-                sed -i '/^<?php/a define('\''DISABLE_WP_CRON'\'', true);' "$config" 2>/dev/null
-            else
-                sed -i "s/define( *'DISABLE_WP_CRON' *, *false *);/define('DISABLE_WP_CRON', true);/g" "$config" 2>/dev/null
-                sed -i "s/define( *\"DISABLE_WP_CRON\" *, *false *);/define('DISABLE_WP_CRON', true);/g" "$config" 2>/dev/null
-            fi
-
-            if grep -q "define.*DISABLE_WP_CRON.*true" "$config" 2>/dev/null; then
-                echo -e "${GREEN}✅ สำเร็จ${NC}"
-                ((GRAND_ADD_SUCCESS++))
-            else
-                echo -e "${RED}❌ ล้มเหลว${NC}"
-                ((GRAND_ADD_FAILED++))
-                ALL_FAILURES+=("$label → $domain (เพิ่ม/แก้) → $config")
-                backup_file=$(ls -t "${config}.bak_wpcron_"* 2>/dev/null | head -1)
-                [[ -f "$backup_file" ]] && cp "$backup_file" "$config"
-            fi
-        done
-    fi
-
-    # สรุปต่อ cPanel
-    echo ""
-    echo -e "  📊 ${PURPLE}$label${NC}: ซ้ำลบ=${#DUPLICATED[@]} | เพิ่ม/แก้=${#NOT_DISABLED[@]} | skip=${#DISABLED[@]} | รวม=$local_total"
-
 done
 
-# ==================== สรุปรวมทั้งหมด ====================
+echo ""
+
+# ==================== แสดงผลก่อนแก้ไข ====================
+
+echo -e "${RED}❌ เว็บที่ยังไม่ได้ปิด (${#NOT_DISABLED[@]} เว็บ):${NC}"
+echo "------------------------------------------------------"
+[[ ${#NOT_DISABLED[@]} -eq 0 ]] && echo "  (ไม่มี)"
+i=1
+for entry in "${NOT_DISABLED[@]}"; do
+    domain=$(echo "$entry" | cut -d'|' -f1)
+    config=$(echo "$entry" | cut -d'|' -f2)
+    status=$(echo "$entry" | cut -d'|' -f3)
+    [[ "$status" == "set_but_false" ]] \
+        && label="${YELLOW}[มีค่าแต่เป็น false]${NC}" \
+        || label="${RED}[ไม่มีค่านี้เลย]${NC}"
+    echo -e "  $i. ${CYAN}$domain${NC} $label"
+    echo -e "      ${PURPLE}$config${NC}"
+    ((i++))
+done
 
 echo ""
+echo -e "${YELLOW}🔁 เว็บที่มีบรรทัดซ้ำ (${#DUPLICATE[@]} เว็บ):${NC}"
+echo "------------------------------------------------------"
+[[ ${#DUPLICATE[@]} -eq 0 ]] && echo "  (ไม่มี)"
+k=1
+for entry in "${DUPLICATE[@]}"; do
+    domain=$(echo "$entry" | cut -d'|' -f1)
+    config=$(echo "$entry" | cut -d'|' -f2)
+    echo -e "  $k. ${YELLOW}$domain${NC}"
+    echo -e "      ${PURPLE}$config${NC}"
+    ((k++))
+done
+
+echo ""
+echo -e "${GREEN}✅ เว็บที่ปิดแล้ว (${#DISABLED[@]} เว็บ):${NC}"
+echo "------------------------------------------------------"
+[[ ${#DISABLED[@]} -eq 0 ]] && echo "  (ไม่มี)"
+j=1
+for entry in "${DISABLED[@]}"; do
+    domain=$(echo "$entry" | cut -d'|' -f1)
+    config=$(echo "$entry" | cut -d'|' -f2)
+    echo -e "  $j. ${GREEN}$domain${NC}"
+    echo -e "      ${PURPLE}$config${NC}"
+    ((j++))
+done
+
+TOTAL=$(( ${#NOT_DISABLED[@]} + ${#DISABLED[@]} + ${#DUPLICATE[@]} ))
 echo ""
 echo "======================================================"
+echo -e "  📊 สรุปก่อนแก้ไข:"
+for path in "${SEARCH_PATHS[@]}"; do
+    count=$(find "$path" -maxdepth 6 -name "wp-config.php" \
+        -not -path "*/backup*" -not -name "*.bak*" -not -name "*.bak_wpcron*" \
+        2>/dev/null | wc -l)
+    echo -e "  📂 $path : ${CYAN}$count เว็บ${NC}"
+done
+echo -e "  🔴 ยังไม่ปิด       : ${RED}${#NOT_DISABLED[@]} เว็บ${NC}"
+echo -e "  🟡 ซ้ำ (ต้องลบซ้ำ) : ${YELLOW}${#DUPLICATE[@]} เว็บ${NC}"
+echo -e "  🟢 ปิดแล้ว (ปกติ)  : ${GREEN}${#DISABLED[@]} เว็บ${NC}"
+echo -e "  📁 ทั้งหมด         : ${CYAN}${TOTAL} เว็บ${NC}"
 echo "======================================================"
-echo -e "  📊 ${BLUE}สรุปรวมทั้งหมด:${NC}"
+echo ""
+
+if [[ ${#NOT_DISABLED[@]} -eq 0 && ${#DUPLICATE[@]} -eq 0 ]]; then
+    echo -e "${GREEN}🎉 ทุกเว็บปิด DISABLE_WP_CRON แล้ว และไม่มีบรรทัดซ้ำ!${NC}"
+    exit 0
+fi
+
+# ==================== แก้ไขอัตโนมัติ ====================
+
+echo -e "${BLUE}🔧 กำลังแก้ไข wp-config.php อัตโนมัติ...${NC}"
 echo "======================================================"
-echo -e "  🟡 ลบซ้ำสำเร็จ     : ${GREEN}${GRAND_DEDUP_SUCCESS} เว็บ${NC}"
-echo -e "  🟡 ลบซ้ำล้มเหลว    : ${RED}${GRAND_DEDUP_FAILED} เว็บ${NC}"
-echo -e "  ✅ เพิ่ม/แก้สำเร็จ  : ${GREEN}${GRAND_ADD_SUCCESS} เว็บ${NC}"
-echo -e "  ❌ เพิ่ม/แก้ล้มเหลว : ${RED}${GRAND_ADD_FAILED} เว็บ${NC}"
-echo -e "  🟢 ปิดอยู่แล้ว → skip: ${GREEN}${GRAND_DISABLED} เว็บ${NC}"
-echo -e "  📁 ทั้งหมด           : ${CYAN}${GRAND_TOTAL} เว็บ${NC}"
+echo ""
+
+SUCCESS=()
+FAILED=()
+
+# --- แก้เว็บที่ยังไม่ปิด ---
+for entry in "${NOT_DISABLED[@]}"; do
+    domain=$(echo "$entry" | cut -d'|' -f1)
+    config=$(echo "$entry" | cut -d'|' -f2)
+    status=$(echo "$entry" | cut -d'|' -f3)
+
+    echo -ne "  🔧 ${CYAN}$domain${NC} ... "
+    cp "$config" "${config}.bak_wpcron_$(date +%Y%m%d%H%M%S)" 2>/dev/null
+
+    if [[ "$status" == "not_set" ]]; then
+        sed -i "/^<?php/a define('DISABLE_WP_CRON', true);" "$config" 2>/dev/null
+    else
+        sed -i "s/define( *'DISABLE_WP_CRON' *, *false *);/define('DISABLE_WP_CRON', true);/g"  "$config" 2>/dev/null
+        sed -i "s/define( *\"DISABLE_WP_CRON\" *, *false *);/define('DISABLE_WP_CRON', true);/g" "$config" 2>/dev/null
+    fi
+
+    if grep -q "define.*DISABLE_WP_CRON.*true" "$config" 2>/dev/null; then
+        echo -e "${GREEN}✅ สำเร็จ${NC}"
+        SUCCESS+=("$domain")
+    else
+        echo -e "${RED}❌ ล้มเหลว${NC}"
+        FAILED+=("$domain|$config")
+        backup_file=$(ls -t "${config}.bak_wpcron_"* 2>/dev/null | head -1)
+        [[ -f "$backup_file" ]] && cp "$backup_file" "$config"
+    fi
+done
+
+# --- แก้เว็บที่มีบรรทัดซ้ำ ---
+for entry in "${DUPLICATE[@]}"; do
+    domain=$(echo "$entry" | cut -d'|' -f1)
+    config=$(echo "$entry" | cut -d'|' -f2)
+
+    echo -ne "  🔁 ${YELLOW}$domain${NC} (ลบซ้ำ) ... "
+    cp "$config" "${config}.bak_wpcron_$(date +%Y%m%d%H%M%S)" 2>/dev/null
+
+    sed -i "/DISABLE_WP_CRON/d" "$config" 2>/dev/null
+    sed -i "/^<?php/a define('DISABLE_WP_CRON', true);" "$config" 2>/dev/null
+
+    if grep -q "define.*DISABLE_WP_CRON.*true" "$config" 2>/dev/null; then
+        echo -e "${GREEN}✅ สำเร็จ${NC}"
+        SUCCESS+=("$domain")
+    else
+        echo -e "${RED}❌ ล้มเหลว${NC}"
+        FAILED+=("$domain|$config")
+        backup_file=$(ls -t "${config}.bak_wpcron_"* 2>/dev/null | head -1)
+        [[ -f "$backup_file" ]] && cp "$backup_file" "$config"
+    fi
+done
+
+# ==================== สรุปหลังแก้ไข ====================
+
+echo ""
+echo "======================================================"
+echo -e "  📊 สรุปหลังแก้ไข:"
+echo -e "  ✅ แก้ไขสำเร็จ : ${GREEN}${#SUCCESS[@]} เว็บ${NC}"
+echo -e "  ❌ แก้ไขล้มเหลว: ${RED}${#FAILED[@]} เว็บ${NC}"
+echo -e "  🟢 ปิดอยู่แล้ว : ${GREEN}${#DISABLED[@]} เว็บ${NC}"
+echo -e "  📁 ทั้งหมด     : ${CYAN}${TOTAL} เว็บ${NC}"
 echo "======================================================"
 
-if [[ ${#ALL_FAILURES[@]} -gt 0 ]]; then
+if [[ ${#FAILED[@]} -gt 0 ]]; then
     echo ""
-    echo -e "${RED}⚠️  รายการที่ล้มเหลว (ตรวจสอบ permission):${NC}"
-    for f in "${ALL_FAILURES[@]}"; do
-        echo -e "  - ${RED}$f${NC}"
+    echo -e "${RED}⚠️  เว็บที่แก้ไขล้มเหลว (ตรวจสอบ permission):${NC}"
+    for entry in "${FAILED[@]}"; do
+        domain=$(echo "$entry" | cut -d'|' -f1)
+        config=$(echo "$entry" | cut -d'|' -f2)
+        echo -e "  - ${RED}$domain${NC}"
+        echo -e "    → $config"
     done
 fi
 
