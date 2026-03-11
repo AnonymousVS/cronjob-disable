@@ -1,3 +1,4 @@
+# ปรับแก้ Complete 100% ใช้งานได้ทุก cPanel พร้อมกัน ที่ย้ายโฮสมา รวมถึงทั้ง /home /home /public_html 
 # DISABLE_WP_CRON - Auto Scanner & Fixer
 
 สคริปต์สำหรับตรวจสอบและเพิ่ม `DISABLE_WP_CRON` ใน `wp-config.php` อัตโนมัติ
