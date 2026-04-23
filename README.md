@@ -15,6 +15,25 @@ WordPress มีระบบ wp-cron ที่ทำงานทุกครั�
 
 ---
 
+## วิธีใช้งาน (One-liner ไม่ต้องโหลดลง server)
+
+### รันทุก user (ทั้ง server)
+```bash
+bash <(curl -s https://raw.githubusercontent.com/AnonymousVS/cronjob-disable/main/edit-disable-wordpress.sh)
+```
+
+### รันเฉพาะ user เดียว
+```bash
+bash <(curl -s https://raw.githubusercontent.com/AnonymousVS/cronjob-disable/main/edit-disable-wordpress.sh) y2026m04ns504
+```
+
+### รันหลาย user พร้อมกัน
+```bash
+bash <(curl -s https://raw.githubusercontent.com/AnonymousVS/cronjob-disable/main/edit-disable-wordpress.sh) jan2026newkey y2026m03sv01 y2026m04ns504
+```
+
+---
+
 ## สิ่งที่ script นี้ทำ
 
 1. **Scan** — อ่านโดเมนทั้งหมดจาก `/etc/userdomains`
@@ -35,24 +54,6 @@ WordPress มีระบบ wp-cron ที่ทำงานทุกครั�
 
 ---
 
-## วิธีใช้งาน (One-liner ไม่ต้องโหลดลง server)
-
-### รันทุก user (ทั้ง server)
-```bash
-bash <(curl -s https://raw.githubusercontent.com/AnonymousVS/cronjob-disable/main/edit-disable-wordpress.sh)
-```
-
-### รันเฉพาะ user เดียว
-```bash
-bash <(curl -s https://raw.githubusercontent.com/AnonymousVS/cronjob-disable/main/edit-disable-wordpress.sh) y2026m04ns504
-```
-
-### รันหลาย user พร้อมกัน
-```bash
-bash <(curl -s https://raw.githubusercontent.com/AnonymousVS/cronjob-disable/main/edit-disable-wordpress.sh) jan2026newkey y2026m03sv01 y2026m04ns504
-```
-
----
 
 ## วิธีติดตั้ง (ถ้าต้องการเก็บไว้ใน server)
 
